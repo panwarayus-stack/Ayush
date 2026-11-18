@@ -43,8 +43,8 @@ from uvicorn import Server
 # Configuration — REPLACE ALL PLACEHOLDERS
 # ---------------------------------------------------------------------------
 
-HF_TOKEN: str = "hf_REPLACE_WITH_YOUR_READ_WRITE_TOKEN"
-HF_BUCKET: str = "hf://buckets/nezuhub/bucket"  # example from requirements
+HF_TOKEN: str = "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"
+HF_BUCKET: str = "hf://buckets/nezuhub/pvtltd"  # example from requirements
 HF_BUCKET_ID: str = HF_BUCKET.removeprefix("hf://buckets/")  # "nezuhub/bucket"
 
 API_KEY: str = "I-AM-M4W3I4DO"
