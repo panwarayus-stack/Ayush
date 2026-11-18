@@ -47,7 +47,7 @@ HF_TOKEN: str = "hf_REPLACE_WITH_YOUR_READ_WRITE_TOKEN"
 HF_BUCKET: str = "hf://buckets/nezuhub/bucket"  # example from requirements
 HF_BUCKET_ID: str = HF_BUCKET.removeprefix("hf://buckets/")  # "nezuhub/bucket"
 
-API_KEY: str = "REPLACE_WITH_A_LONG_RANDOM_API_KEY"
+API_KEY: str = "I-AM-M4W3I4DO"
 
 # 32-byte hex/base64 key for AES-256-GCM. Generate with:
 #   python -c "import secrets; print(secrets.token_hex(32))"
