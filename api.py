@@ -8,6 +8,8 @@ correct WebRTC negotiation, keep-alive, and reconnection.
 
 from __future__ import annotations
 
+from settings import setting
+
 import asyncio
 import base64
 import hashlib
@@ -54,19 +56,19 @@ from pytgcalls.exceptions import (
 # CONFIG
 # ============================================================
 
-TELEGRAM_API_ID = os.environ.get("TELEGRAM_API_ID", "")
-TELEGRAM_API_HASH = os.environ.get("TELEGRAM_API_HASH", "")
-ENCRYPTION_KEY_HEX = os.environ.get("ENCRYPTION_KEY_HEX", "")
-BACKEND_API_TOKEN = os.environ.get("BACKEND_API_TOKEN", "")
+TELEGRAM_API_ID = setting("TELEGRAM_API_ID", "")
+TELEGRAM_API_HASH = setting("TELEGRAM_API_HASH", "")
+ENCRYPTION_KEY_HEX = setting("ENCRYPTION_KEY_HEX", "")
+BACKEND_API_TOKEN = setting("BACKEND_API_TOKEN", "")
 
 MAX_ACCOUNTS: Optional[int] = None
 
-DB_PATH = pathlib.Path(os.environ.get("DB_PATH", pathlib.Path(__file__).resolve().parent / "db.json")).resolve()
+DB_PATH = pathlib.Path(setting("DB_PATH", str(pathlib.Path(__file__).resolve().parent / "db.json"))).resolve()
 LOGIN_TTL = 600
 TELEGRAM_TIMEOUT = 20
 
 BIND_HOST = "127.0.0.1"
-BIND_PORT = int(os.environ.get("PORT", "11584"))
+BIND_PORT = int(setting("PORT", "11584"))
 
 # ============================================================
 # STATE

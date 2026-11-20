@@ -2,9 +2,9 @@
 
 Install with `python -m pip install -r requirements.txt` in a virtual environment.
 
-Set these environment variables before starting the services:
+Copy `credentials.example.json` to `credentials.json` beside `api.py` and `bot.py`, then fill in your existing values. No environment variables are required; any that are already set override the corresponding file values. Keep `credentials.json` private: Git ignores it. On Linux/macOS, use `chmod 600 credentials.json`.
 
-| Variable | Service | Value |
+| Setting | Service | Value |
 | --- | --- | --- |
 | `TELEGRAM_API_ID`, `TELEGRAM_API_HASH` | API | Telegram application credentials |
 | `ENCRYPTION_KEY_HEX` | API | 32-byte key encoded as 64 hex characters |

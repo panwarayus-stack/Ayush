@@ -5,3 +5,5 @@ db.json*
 .write_probe
 
 .db.json-*
+
+/credentials.json
