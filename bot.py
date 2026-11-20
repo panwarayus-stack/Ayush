@@ -914,13 +914,12 @@ def _clear_flow(context, flow) -> None:
     timer = flow.pop("timer", None)
     if timer:
         timer.cancel()
-    if context.bot_data.get("flow") is flow:
-        context.bot_data.pop("flow", None)
+    if context.user_data.get("flow") is flow:
         context.user_data.clear()
 
 
 async def _expire_flow(update, context, flow) -> None:
-    if context.bot_data.get("flow") is not flow or flow.get("expiring"):
+    if context.user_data.get("flow") is not flow or flow.get("expiring"):
         return
     flow["expiring"] = True
     try:
@@ -943,9 +942,15 @@ def _flow_callback(state, data):
     return None
 
 
+async def _dispatch_owner_update(update, context) -> None:
+    locks = context.bot_data.setdefault("owner_update_locks", {})
+    async with locks.setdefault(update.effective_user.id, asyncio.Lock()):
+        await _dispatch_command(update, context)
+
+
 async def _dispatch_command(update, context) -> None:
     loop = asyncio.get_running_loop()
-    flow = context.bot_data.get("flow")
+    flow = context.user_data.get("flow")
     query = update.callback_query
     message = update.message
     text = message.text if message and message.text else ""
@@ -953,17 +958,22 @@ async def _dispatch_command(update, context) -> None:
     owner = update.effective_user.id
 
     if flow is not None:
-        if flow["owner"] != owner:
-            if query:
-                await query.answer("Another owner has a command in progress", show_alert=True)
-            elif text:
-                await message.reply_text("⏳ Another owner has a command in progress. Try again when it finishes.")
-            return
         if loop.time() >= flow["deadline"]:
             if query:
                 await query.answer("Command expired", show_alert=True)
             await _expire_flow(update, context, flow)
             return
+        if not query and command in MENU_HANDLERS:
+            handler = MENU_HANDLERS[command]
+            if handler in {cmd_status, cmd_accounts, cmd_help, cmd_backup}:
+                try:
+                    await asyncio.wait_for(handler(update, context), COMMAND_TIMEOUT)
+                except TimeoutError:
+                    await message.reply_text("⌛ Command timed out after 15 minutes.")
+                return
+            await _cancel_pending_login(context)
+            _clear_flow(context, flow)
+            return await _dispatch_command(update, context)
         state = flow.get("state")
         if query:
             handler = _flow_callback(state, query.data or "")
@@ -976,7 +986,7 @@ async def _dispatch_command(update, context) -> None:
             handler = STEP_HANDLERS[state]
         else:
             if message:
-                await message.reply_text("⏳ Finish the current command or use /cancel before starting another.")
+                await message.reply_text("Send the requested reply, choose another menu option, or use /cancel.")
             return
     else:
         if query:
@@ -991,7 +1001,7 @@ async def _dispatch_command(update, context) -> None:
             return
         flow = {"owner": owner, "chat_id": update.effective_chat.id,
                 "deadline": loop.time() + COMMAND_TIMEOUT}
-        context.bot_data["flow"] = flow
+        context.user_data["flow"] = flow
 
     timer = flow.pop("timer", None)
     if timer:
@@ -1020,7 +1030,13 @@ async def _dispatch_command(update, context) -> None:
         return
     flow["state"] = state
     flow["timer"] = loop.call_at(flow["deadline"], lambda: context.application.create_task(
-        _expire_flow(update, context, flow), update=update))
+        _expire_owner_flow(update, context, flow), update=update))
+
+
+async def _expire_owner_flow(update, context, flow) -> None:
+    locks = context.bot_data.setdefault("owner_update_locks", {})
+    async with locks.setdefault(flow["owner"], asyncio.Lock()):
+        await _expire_flow(update, context, flow)
 
 
 def main() -> None:
@@ -1039,11 +1055,11 @@ def main() -> None:
     if not BACKEND_URL.startswith(("http://", "https://")):
         raise SystemExit("BACKEND_URL must start with http:// or https://")
     log.info("Starting bot — backend=%s (unlimited accounts, VC=all)", BACKEND_URL)
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).concurrent_updates(16).build()
 
     app.bot_data["owners"] = owners
     app.add_handler(TypeHandler(Update, _require_owner), group=-1)
-    app.add_handler(TypeHandler(Update, _dispatch_command))
+    app.add_handler(TypeHandler(Update, _dispatch_owner_update))
     app.add_error_handler(error_handler)
 
     log.info("Bot polling started")
