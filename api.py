@@ -14,6 +14,7 @@ import hashlib
 import json
 import logging
 import os
+import re
 import secrets
 import tempfile
 import time
@@ -28,11 +29,16 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
-from telethon import TelegramClient, types, utils
+from telethon import TelegramClient, functions, types, utils
 from telethon.errors import (
     AuthKeyUnregisteredError,
     ChannelPrivateError,
     GroupcallForbiddenError,
+    InviteHashEmptyError,
+    InviteHashExpiredError,
+    InviteHashInvalidError,
+    InviteRequestSentError,
+    UserAlreadyParticipantError,
     FloodWaitError,
     PhoneCodeExpiredError,
     PhoneCodeInvalidError,
@@ -482,9 +488,20 @@ async def _keepalive_loop() -> None:
 
 @asynccontextmanager
 async def lifespan(app: FastAPI) -> AsyncIterator[None]:
-    if not BACKEND_API_TOKEN or not TELEGRAM_API_HASH or not TELEGRAM_API_ID.isdecimal() or int(TELEGRAM_API_ID) <= 0:
-        raise RuntimeError("Set TELEGRAM_API_ID, TELEGRAM_API_HASH and BACKEND_API_TOKEN")
-    _get_aesgcm()
+    invalid = []
+    if not TELEGRAM_API_ID.isascii() or not TELEGRAM_API_ID.isdecimal() or int(TELEGRAM_API_ID) <= 0:
+        invalid.append("TELEGRAM_API_ID")
+    if not TELEGRAM_API_HASH.strip():
+        invalid.append("TELEGRAM_API_HASH")
+    if not BACKEND_API_TOKEN.strip():
+        invalid.append("BACKEND_API_TOKEN")
+    try:
+        _get_aesgcm()
+    except ValueError:
+        invalid.append("ENCRYPTION_KEY_HEX")
+    if invalid:
+        raise RuntimeError("Missing or invalid API settings: " + ", ".join(invalid)
+                           + ". Configure credentials.json beside api.py or set environment variables.")
     log.info("Starting up")
     storage = check_local_storage()
     app_state["storage_ready"] = storage["connected"]
@@ -775,7 +792,7 @@ class VoiceEngine(PyTgCalls):
                     return False
 
                 if not await asyncio.wait_for(find_dialog(), TELEGRAM_TIMEOUT):
-                    raise HTTPException(403, "This Telegram account cannot access the private channel. Check its membership and the chat ID.")
+                    raise HTTPException(403, "Private channel not found in this account’s Telegram dialogs. Verify membership and copy a post link from inside the channel.")
         return resolved
 
     async def _handle_connection_changed(self, chat_id, net_state):
@@ -930,11 +947,53 @@ async def _do_join(account_id: str, chat: str, muted: bool, video_stopped: bool)
         return await _join_voice_call(account_id, chat)
 
 
+def _private_invite_hash(chat: str) -> str | None:
+    match = re.fullmatch(
+        r"(?:(?:https?://)?(?:t\.me|telegram\.me)/)?(?:\+|joinchat/)([A-Za-z0-9_-]{1,128})/?(?:\?[^#]*)?",
+        chat.strip(),
+    )
+    return match.group(1) if match else None
+
+
+async def _resolve_voice_target(tg: VoiceEngine, chat: str, *, join_channel: bool) -> int:
+    invite_hash = _private_invite_hash(chat)
+    if invite_hash is None:
+        return await tg.resolve_chat_id(chat)
+    client = tg.telegram_client
+    check = functions.messages.CheckChatInviteRequest(invite_hash)
+    try:
+        invite = await asyncio.wait_for(client(check), TELEGRAM_TIMEOUT)
+        if not isinstance(invite, types.ChatInviteAlready):
+            if not join_channel:
+                raise HTTPException(403, "This account is not a member of the private channel")
+            try:
+                updates = await asyncio.wait_for(client(functions.messages.ImportChatInviteRequest(invite_hash)), TELEGRAM_TIMEOUT)
+                joined = [entity for entity in getattr(updates, "chats", ())
+                          if isinstance(entity, (types.Chat, types.Channel)) and not entity.left]
+                if len(joined) == 1:
+                    return utils.get_peer_id(joined[0])
+            except UserAlreadyParticipantError:
+                pass
+            invite = await asyncio.wait_for(client(check), TELEGRAM_TIMEOUT)
+        if not isinstance(invite, types.ChatInviteAlready):
+            raise HTTPException(409, "Telegram has not confirmed private channel membership")
+        return utils.get_peer_id(invite.chat)
+    except InviteRequestSentError as exc:
+        raise HTTPException(409, "Join request sent. Wait for an admin to approve it, then retry Join VC.") from exc
+    except (InviteHashEmptyError, InviteHashExpiredError, InviteHashInvalidError) as exc:
+        raise HTTPException(400, "Private invite link is invalid or expired. Get a fresh invite link.") from exc
+    except (HTTPException, FloodWaitError, ChannelPrivateError, TimeoutError):
+        raise
+    except Exception as exc:
+        log.warning("Private invite lookup failed err=%s", type(exc).__name__)
+        raise HTTPException(502, "Telegram could not resolve or join the private channel") from exc
+
+
 async def _join_voice_call(account_id: str, chat: str) -> dict[str, Any]:
     """Join without transmitting media and remember the requested connection."""
     try:
         tg = await _get_tgcalls(account_id)
-        chat_id = await tg.resolve_chat_id(chat)
+        chat_id = await _resolve_voice_target(tg, chat, join_channel=True)
         if chat_id >= 0:
             return {"ok": False, "error": "A group or channel is required", "status_code": 400}
         await _connect_voice_call(tg, chat_id)
@@ -978,7 +1037,7 @@ async def _leave_voice_call(account_id: str, chat: str) -> dict[str, Any]:
         tg = app_state["tgcalls"].get(account_id)
         if not tg:
             return {"ok": False, "error": "Account is not in any call"}
-        chat_id = await tg.resolve_chat_id(chat)
+        chat_id = await _resolve_voice_target(tg, chat, join_channel=False)
         was_requested = app_state["voice_targets"].get(account_id, {}).pop(chat_id, None) is not None
         try:
             await asyncio.wait_for(tg.leave_call(chat_id), timeout=10)
@@ -1092,7 +1151,7 @@ async def voice_join_all(payload: VoiceRequest) -> dict[str, Any]:
     )
     log.info(
         "Bulk join chat=%s total=%d ok=%d fail=%d ms=%d",
-        payload.chat, summary["total"], summary["succeeded"],
+        ("private invite" if _private_invite_hash(payload.chat) else payload.chat), summary["total"], summary["succeeded"],
         summary["failed"], summary["duration_ms"],
     )
     return summary
@@ -1109,7 +1168,7 @@ async def voice_leave_all(payload: VoiceRequest) -> dict[str, Any]:
     )
     log.info(
         "Bulk leave chat=%s total=%d ok=%d fail=%d ms=%d",
-        payload.chat, summary["total"], summary["succeeded"],
+        ("private invite" if _private_invite_hash(payload.chat) else payload.chat), summary["total"], summary["succeeded"],
         summary["failed"], summary["duration_ms"],
     )
     return summary

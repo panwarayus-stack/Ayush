@@ -176,8 +176,9 @@ def _normalize_chat_ref(raw: str) -> str | None:
     private_post = re.fullmatch(r"c/([1-9][0-9]{0,17})/[1-9][0-9]*(?:/[1-9][0-9]*)?", s)
     if telegram_link and private_post:
         return "-100" + private_post.group(1)
-    if s.startswith("+") or s.startswith("joinchat/"):
-        return None
+    invite = re.fullmatch(r"(?:\+|joinchat/)([A-Za-z0-9_-]{1,128})", s)
+    if telegram_link and invite:
+        return "+" + invite.group(1)
     if re.fullmatch(r"-[0-9]+", s):
         return s
     if re.fullmatch(r"@?[a-zA-Z][a-zA-Z0-9_]{0,31}", s):
@@ -187,6 +188,10 @@ def _normalize_chat_ref(raw: str) -> str | None:
 # ============================================================
 # COMMANDS
 # ============================================================
+
+def _display_chat_ref(ref: str) -> str:
+    return "private channel invite" if ref.startswith("+") else ref
+
 
 async def cmd_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     online = False
@@ -577,7 +582,7 @@ async def _voice_show_results(q, context, ref: str, op: str, results) -> int:
     fail = [r for r in results if not r[2]]
 
     lines = [
-        f"{icon} {verb} results — {ref}",
+        f"{icon} {verb} results — {_display_chat_ref(ref)}",
         f"✅ {'Joined' if op == 'join' else 'Left'}: {len(ok)}/{len(results)}",
     ]
     if not fail:
@@ -587,7 +592,7 @@ async def _voice_show_results(q, context, ref: str, op: str, results) -> int:
 
     lines.append(f"❌ {'Not joined' if op == 'join' else 'Leave failed'}: {len(fail)}/{len(results)}")
     for aid, label, _, info in fail[:10]:
-        lines.append(f"  • {label} ({aid}): {info[:80]}")
+        lines.append(f"  • {label} ({aid}): {info[:180]}")
     if len(fail) > 10:
         lines.append(f"  …and {len(fail) - 10} more (see backend logs)")
 
@@ -645,7 +650,7 @@ async def _voice_confirm(update, context, op: str) -> int:
     icon = "🎙️" if op == "join" else "🔴"
     verb = "Joining" if op == "join" else "Leaving"
     await q.edit_message_text(
-        f"{icon} {verb} {ref} with {len(accounts)} account(s)…\n\n"
+        f"{icon} {verb} {_display_chat_ref(ref)} with {len(accounts)} account(s)…\n\n"
         "This may take a minute — please wait."
     )
 
@@ -693,7 +698,7 @@ async def joinvc_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     await update.message.reply_text(
         "🎙️ Send the group / VC link.\n\n"
         "Accepted: `https://t.me/groupname`, `@groupname`, `-1001234567890`\n\n"
-        "For a private channel you already belong to, send a t.me/c/... post link or its -100… ID. Invite links are not supported.\n\n"
+        "For a private channel, send its t.me/+… invite link to join the channel first, or a t.me/c/… post link if already a member.\n\n"
         "The bot will attempt to join with all registered accounts."
     )
     return JOINVC_LINK
@@ -704,7 +709,7 @@ async def joinvc_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     ref = _normalize_chat_ref(raw)
     if ref is None:
         await update.message.reply_text(
-            "❌ Use a public username, private t.me/c/... post link, or numeric chat ID. Invite links are not supported.\n\n"
+            "❌ Use a public username, t.me/+… invite, t.me/c/… post link, or numeric chat ID.\n\n"
             "Use a public @username or numeric chat ID.\n"
             "Examples: @mygroup  or  -1001234567890",
         )
@@ -730,10 +735,12 @@ async def joinvc_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         InlineKeyboardButton(f"✅ Join all {len(accounts)}", callback_data="join_confirm"),
         InlineKeyboardButton("❌ Cancel",                   callback_data="join_cancel"),
     ]])
+    target = "private channel invite" if ref.startswith("+") else ref
+    membership_note = "Accounts will join the channel first if needed. Leaving VC will not leave the channel.\n\n" if ref.startswith("+") else ""
     prompt = await update.message.reply_text(
-        f"🎙️ Target: {ref}\n\n"
+        f"🎙️ Target: {target}\n\n"
         f"This will attempt to join with {len(accounts)} registered account(s).\n\n"
-        "Confirm?",
+        f"{membership_note}Confirm?",
         reply_markup=kb,
     )
     context.user_data["join_prompt"] = prompt.message_id
@@ -765,7 +772,7 @@ async def leavevc_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     ref = _normalize_chat_ref(raw)
     if ref is None:
         await update.message.reply_text(
-            "❌ Use a public username, private t.me/c/... post link, or numeric chat ID. Invite links are not supported.\n\n"
+            "❌ Use a public username, t.me/+… invite, t.me/c/… post link, or numeric chat ID.\n\n"
             "Use a public @username or numeric chat ID.",
         )
         return LEAVEVC_LINK
@@ -791,7 +798,7 @@ async def leavevc_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         InlineKeyboardButton("❌ Cancel",                    callback_data="leave_cancel"),
     ]])
     prompt = await update.message.reply_text(
-        f"🔴 Target: {ref}\n\n"
+        f"🔴 Target: {_display_chat_ref(ref)}\n\n"
         f"This will remove **ALL {len(accounts)} account(s)** from the call.\n\n"
         "Confirm?",
         reply_markup=kb,
@@ -834,8 +841,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 
 async def _probe_backend() -> bool:
     try:
-        async with httpx.AsyncClient() as c:
-            r = await c.get(f"{BACKEND_URL}/health", timeout=5.0)
+        async with httpx.AsyncClient(headers={"Authorization": f"Bearer {BACKEND_API_TOKEN}"}) as c:
+            r = await c.get(f"{BACKEND_URL}/status", timeout=5.0)
+            if r.status_code == 401:
+                log.error("Backend rejected authentication; use the same BACKEND_API_TOKEN for api.py and bot.py")
+                return False
             if r.status_code == 200:
                 log.info("✅ Backend reachable at %s", BACKEND_URL)
                 return True
@@ -874,8 +884,16 @@ async def _post_init(application: Application) -> None:
 
 
 def main() -> None:
-    if not TELEGRAM_BOT_TOKEN or not BACKEND_API_TOKEN or not BOT_OWNER_ID.isdecimal():
-        raise SystemExit("Set TELEGRAM_BOT_TOKEN, BACKEND_API_TOKEN and BOT_OWNER_ID")
+    invalid = []
+    if ":" not in TELEGRAM_BOT_TOKEN:
+        invalid.append("TELEGRAM_BOT_TOKEN")
+    if not BACKEND_API_TOKEN.strip():
+        invalid.append("BACKEND_API_TOKEN")
+    if not BOT_OWNER_ID.isascii() or not BOT_OWNER_ID.isdecimal() or int(BOT_OWNER_ID) <= 0:
+        invalid.append("BOT_OWNER_ID")
+    if invalid:
+        raise SystemExit("Missing or invalid bot settings: " + ", ".join(invalid)
+                         + ". Configure credentials.json beside bot.py or set environment variables.")
     if not BACKEND_URL.startswith(("http://", "https://")):
         raise SystemExit("BACKEND_URL must start with http:// or https://")
     log.info("Starting bot — backend=%s (unlimited accounts, VC=all)", BACKEND_URL)
