@@ -1,0 +1,7 @@
+__pycache__/
+.venv/
+.env
+db.json*
+.write_probe
+
+.db.json-*

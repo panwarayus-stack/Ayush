@@ -9,8 +9,7 @@ import asyncio
 import logging
 import os
 import re
-import sys
-import time
+import uuid
 
 import httpx
 from telegram import (
@@ -20,8 +19,11 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
+from telegram.error import TelegramError
 from telegram.ext import (
     Application,
+    ApplicationHandlerStop,
+    TypeHandler,
     CallbackQueryHandler,
     CommandHandler,
     ContextTypes,
@@ -34,22 +36,18 @@ from telegram.ext import (
 # CONFIG  (unchanged)
 # ============================================================
 
-_DEFAULT_BOT_TOKEN   = "9268658834:AAFIyVOtk8HRKqm_v-MHrNxIaDeyjBZau48"
 _DEFAULT_BACKEND_URL = "http://127.0.0.1:11584"
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", _DEFAULT_BOT_TOKEN).strip()
+TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
 BACKEND_URL        = os.environ.get("BACKEND_URL", _DEFAULT_BACKEND_URL).strip().rstrip("/")
 
-if not TELEGRAM_BOT_TOKEN or ":" not in TELEGRAM_BOT_TOKEN:
-    print("ERROR: TELEGRAM_BOT_TOKEN missing or malformed", file=sys.stderr); sys.exit(1)
-if not BACKEND_URL.startswith(("http://", "https://")):
-    print(f"ERROR: BACKEND_URL must start with http(s)://, got {BACKEND_URL!r}",
-          file=sys.stderr); sys.exit(1)
+BACKEND_API_TOKEN = os.environ.get("BACKEND_API_TOKEN", "")
+BOT_OWNER_ID = os.environ.get("BOT_OWNER_ID", "")
 
-TIMEOUT        = 30.0
+TIMEOUT        = 55.0
 BACKUP_TIMEOUT = 90.0
-VOICE_TIMEOUT  = 3600.0          # NEW: voice joins can be slow (SSRC retry in backend)
-VOICE_CONCURRENCY = 10         # NEW: how many accounts join/leave in parallel
+VOICE_TIMEOUT  = 120.0
+VOICE_CONCURRENCY = 10
 
 # ============================================================
 # LOGGING
@@ -62,9 +60,6 @@ logging.basicConfig(
 logging.getLogger("httpx").setLevel(logging.WARNING)
 log = logging.getLogger("tg_bot")
 
-print(f"CONFIG | bot_token=***{TELEGRAM_BOT_TOKEN[-6:]} | backend={BACKEND_URL}",
-      file=sys.stderr)
-
 # ============================================================
 # HTTP
 # ============================================================
@@ -74,7 +69,7 @@ async def _request(method: str, path: str, json: dict | None = None,
     url = f"{BACKEND_URL}{path}"
     for attempt in (1, 2):
         try:
-            async with httpx.AsyncClient() as c:
+            async with httpx.AsyncClient(headers={"Authorization": f"Bearer {BACKEND_API_TOKEN}"}) as c:
                 if method == "GET":
                     return await c.get(url, timeout=timeout)
                 return await c.post(url, json=json or {}, timeout=timeout)
@@ -157,11 +152,11 @@ def _normalize_chat_ref(raw: str) -> str | None:
         return None
     if s.startswith("+") or s.startswith("joinchat/"):
         return None
-    if s.lstrip("-").isdigit():
+    if re.fullmatch(r"-[0-9]+", s):
         return s
-    if s.startswith("@"):
-        return s
-    return f"@{s}"
+    if re.fullmatch(r"@?[a-zA-Z][a-zA-Z0-9_]{0,31}", s):
+        return "@" + s.lstrip("@")
+    return None
 
 # ============================================================
 # COMMANDS
@@ -238,9 +233,16 @@ async def cmd_accounts(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
     for a in accounts:
         lines.append(
             f"• {a.get('account_id', '?')} — {a.get('label') or '(no label)'}\n"
-            f"  status: {a.get('status', '?')} | session: {'✅' if a.get('session_available') else '❌'}"
+            f"  {a.get('status', '?')} | Telegram: {'connected' if a.get('connected') else 'not connected'}"
+            f" | Saved session: {'yes' if a.get('session_available') else 'no'}"
         )
-    await update.message.reply_text("👥 Registered Accounts\n\n" + "\n\n".join(lines))
+    page = "👥 Registered Accounts (not VC members)"
+    for line in lines:
+        if len(page) + len(line) > 1800:
+            await update.message.reply_text(page)
+            page = "👥 Registered Accounts (continued)"
+        page += "\n\n" + line
+    await update.message.reply_text(page)
 
 
 async def cmd_backup(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -267,14 +269,19 @@ async def cmd_restore(update: Update, context: ContextTypes.DEFAULT_TYPE) -> Non
         InlineKeyboardButton("✅ Yes, restore", callback_data="restore_yes"),
         InlineKeyboardButton("❌ Cancel",       callback_data="restore_no"),
     ]])
-    await update.message.reply_text(
+    prompt = await update.message.reply_text(
         "♻️ Restore will overwrite in-memory accounts from db.json.\n\nConfirm?",
         reply_markup=kb,
     )
+    context.user_data["restore_prompt"] = prompt.message_id
 
 
 async def restore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    if not q.message or q.message.message_id != context.user_data.get("restore_prompt"):
+        await q.answer("This confirmation expired", show_alert=True)
+        return
+    context.user_data.pop("restore_prompt", None)
     await q.answer()
     if q.data == "restore_no":
         await q.edit_message_text("❌ Restore cancelled."); return
@@ -288,6 +295,9 @@ async def restore_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     if r.status_code != 200:
         await q.edit_message_text(f"❌ Restore failed: {r.status_code} {_detail(r)}"); return
     d = r.json()
+    if not d.get("restore_completed"):
+        await q.edit_message_text(f"❌ Restore failed: {d.get('reason', 'unknown error')}")
+        return
     await q.edit_message_text(
         "✅ Restore complete\n"
         f"• Accounts restored: {d.get('accounts_restored', 0)}\n"
@@ -306,22 +316,29 @@ async def cmd_logout(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None
     accounts = r.json() if r.status_code == 200 else []
     if not accounts:
         await update.message.reply_text("📭 No accounts to log out."); return
-    buttons = [[
-        InlineKeyboardButton(
-            f"🚪 {a.get('label') or a.get('account_id')} ({a.get('account_id')})",
-            callback_data=f"logout_{a.get('account_id')}",
+    # Telegram caps callback_data at 64 bytes; IDs can already be 64 bytes.
+    choices = {uuid.uuid4().hex: a for a in accounts}
+    context.user_data["logout_choices"] = {
+        token: account["account_id"] for token, account in choices.items()
+    }
+    buttons = [[InlineKeyboardButton(
+        f"🚪 {a.get('label') or a['account_id']}"[:60], callback_data=f"logout_{token}",
+    )] for token, a in choices.items()]
+    for offset in range(0, len(buttons), 50):
+        await update.message.reply_text(
+            "Which account should log out?",
+            reply_markup=InlineKeyboardMarkup(buttons[offset:offset + 50]),
         )
-    ] for a in accounts]
-    await update.message.reply_text(
-        "Which account should log out?",
-        reply_markup=InlineKeyboardMarkup(buttons),
-    )
 
 
 async def logout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     q = update.callback_query
+    token = q.data.removeprefix("logout_")
+    account_id = context.user_data.get("logout_choices", {}).pop(token, None)
+    if not account_id:
+        await q.answer("This logout button expired", show_alert=True)
+        return
     await q.answer()
-    account_id = q.data.replace("logout_", "", 1)
     try:
         r = await api_post(f"/accounts/{account_id}/logout")
     except httpx.ConnectError:
@@ -333,7 +350,24 @@ async def logout_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
     await q.edit_message_text(f"✅ Logged out {account_id}.")
 
 
+async def _cancel_pending_login(context) -> None:
+    account_id = context.user_data.get("login_account_id")
+    if account_id:
+        try:
+            await api_post(f"/accounts/{account_id}/login/cancel", timeout=5)
+        except httpx.RequestError:
+            pass  # The backend also expires pending clients on its own.
+
+
+async def _erase_credential_message(message) -> None:
+    try:
+        await message.delete()
+    except TelegramError:
+        log.warning("Could not delete a credential message from the private chat")
+
+
 async def cmd_cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await _cancel_pending_login(context)
     context.user_data.clear()
     if update.effective_message:
         await update.effective_message.reply_text(
@@ -370,7 +404,7 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         return LOGIN_PHONE
 
     label = context.user_data.get("login_label", "")
-    account_id = f"acct_{int(time.time() * 1000)}"
+    account_id = f"acct_{uuid.uuid4().hex}"
     context.user_data["login_account_id"] = account_id
 
     try:
@@ -403,6 +437,7 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
 
 async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     code = update.message.text.strip()
+    await _erase_credential_message(update.message)
     if not re.match(r"^\d{3,8}$", code):
         await update.message.reply_text("❌ OTP must be digits. Try again or /cancel.")
         return LOGIN_OTP
@@ -427,28 +462,30 @@ async def login_otp(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     detail = _detail(r)
     if r.status_code == 401 and "2FA" in detail:
-        context.user_data["login_otp"] = code
         await update.message.reply_text("🔐 2FA password required. Enter it now:")
         return LOGIN_2FA
 
+    if r.status_code in (429, 503) or (r.status_code == 401 and "invalid" in detail):
+        await update.message.reply_text(f"❌ {detail}. Try again or /cancel.")
+        return LOGIN_OTP
     await update.message.reply_text(f"❌ Verify failed: {r.status_code} {detail}", reply_markup=MAIN_KEYBOARD)
     context.user_data.clear(); return ConversationHandler.END
 
 
 async def login_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    password = update.message.text.strip()
+    password = update.message.text
+    await _erase_credential_message(update.message)
     if not password:
         await update.message.reply_text("❌ Password empty. Try again or /cancel.")
         return LOGIN_2FA
 
     account_id = context.user_data.get("login_account_id")
-    code = context.user_data.get("login_otp")
-    if not account_id or not code:
+    if not account_id:
         await update.message.reply_text("❌ Session expired. Try 🔐 Login again.", reply_markup=MAIN_KEYBOARD)
         context.user_data.clear(); return ConversationHandler.END
 
     try:
-        r = await api_post(f"/accounts/{account_id}/login/verify", {"code": code, "password": password})
+        r = await api_post(f"/accounts/{account_id}/login/verify", {"password": password})
     except httpx.ConnectError:
         await update.message.reply_text(_conn_error_text(), reply_markup=MAIN_KEYBOARD)
         context.user_data.clear(); return ConversationHandler.END
@@ -458,6 +495,9 @@ async def login_2fa(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
 
     if r.status_code == 200:
         await update.message.reply_text("✅ 2FA verified. Login complete.", reply_markup=MAIN_KEYBOARD)
+    elif r.status_code in (401, 429, 503):
+        await update.message.reply_text(f"❌ {_detail(r)}. Try again or /cancel.")
+        return LOGIN_2FA
     else:
         await update.message.reply_text(f"❌ 2FA failed: {r.status_code} {_detail(r)}", reply_markup=MAIN_KEYBOARD)
     context.user_data.clear(); return ConversationHandler.END
@@ -484,7 +524,14 @@ async def _voice_op_one(account: dict, ref: str, op: str, max_retries: int = 3):
             )
             if r.status_code == 200:
                 return (aid, label, True, "")
-            last_err = f"{r.status_code} {_detail(r)}"[:180]
+            detail = _detail(r)
+            if op == "join" and (r.status_code == 409 or (
+                r.status_code == 502 and "HTTPException: 409:" in detail
+            )):
+                if "HTTPException: 409:" in detail:
+                    detail = "Telegram not connected; check Accounts and sign in again if needed"
+                return (aid, label, False, detail)
+            last_err = f"{r.status_code} {detail}"[:180]
         except httpx.ConnectError:
             last_err = "connect error"
         except Exception as e:
@@ -505,14 +552,14 @@ async def _voice_show_results(q, context, ref: str, op: str, results) -> int:
 
     lines = [
         f"{icon} {verb} results — {ref}",
-        f"✅ Success: {len(ok)}/{len(results)}",
+        f"✅ {'Joined' if op == 'join' else 'Left'}: {len(ok)}/{len(results)}",
     ]
     if not fail:
         context.user_data.clear()
         await q.edit_message_text("\n".join(lines))
         return ConversationHandler.END
 
-    lines.append(f"❌ Failed: {len(fail)}/{len(results)}")
+    lines.append(f"❌ {'Not joined' if op == 'join' else 'Leave failed'}: {len(fail)}/{len(results)}")
     for aid, label, _, info in fail[:10]:
         lines.append(f"  • {label} ({aid}): {info[:80]}")
     if len(fail) > 10:
@@ -536,6 +583,9 @@ async def _voice_show_results(q, context, ref: str, op: str, results) -> int:
 
 async def _voice_confirm(update, context, op: str) -> int:
     q = update.callback_query
+    if not q.message or q.message.message_id != context.user_data.get(f"{op}_prompt"):
+        await q.answer("This voice confirmation expired", show_alert=True)
+        return JOINVC_CONFIRM if op == "join" else LEAVEVC_CONFIRM
     await q.answer()
 
     if q.data.endswith("_cancel"):
@@ -546,7 +596,7 @@ async def _voice_confirm(update, context, op: str) -> int:
     ref = context.user_data.get(f"{op}_link")
     if not ref:
         context.user_data.clear()
-        await q.edit_message_text(f"❌ Session expired. Try again.")
+        await q.edit_message_text("❌ Session expired. Try again.")
         return ConversationHandler.END
 
     try:
@@ -585,6 +635,9 @@ async def _voice_confirm(update, context, op: str) -> int:
 
 async def _voice_retry(update, context, op: str) -> int:
     q = update.callback_query
+    if not q.message or q.message.message_id != context.user_data.get(f"{op}_prompt"):
+        await q.answer("This retry button expired", show_alert=True)
+        return JOINVC_CONFIRM if op == "join" else LEAVEVC_CONFIRM
     await q.answer()
 
     ref = context.user_data.get(f"{op}_link")
@@ -615,7 +668,7 @@ async def joinvc_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         "🎙️ Send the group / VC link.\n\n"
         "Accepted: `https://t.me/groupname`, `@groupname`, `-1001234567890`\n\n"
         "Private invite links (t.me/+abc) are not supported.\n\n"
-        "**All registered accounts** will join the call."
+        "The bot will attempt to join with all registered accounts."
     )
     return JOINVC_LINK
 
@@ -651,12 +704,13 @@ async def joinvc_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         InlineKeyboardButton(f"✅ Join all {len(accounts)}", callback_data="join_confirm"),
         InlineKeyboardButton("❌ Cancel",                   callback_data="join_cancel"),
     ]])
-    await update.message.reply_text(
+    prompt = await update.message.reply_text(
         f"🎙️ Target: {ref}\n\n"
-        f"This will join **ALL {len(accounts)} account(s)** to the call.\n\n"
+        f"This will attempt to join with {len(accounts)} registered account(s).\n\n"
         "Confirm?",
         reply_markup=kb,
     )
+    context.user_data["join_prompt"] = prompt.message_id
     return JOINVC_CONFIRM
 
 
@@ -710,12 +764,13 @@ async def leavevc_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
         InlineKeyboardButton(f"✅ Leave all {len(accounts)}", callback_data="leave_confirm"),
         InlineKeyboardButton("❌ Cancel",                    callback_data="leave_cancel"),
     ]])
-    await update.message.reply_text(
+    prompt = await update.message.reply_text(
         f"🔴 Target: {ref}\n\n"
         f"This will remove **ALL {len(accounts)} account(s)** from the call.\n\n"
         "Confirm?",
         reply_markup=kb,
     )
+    context.user_data["leave_prompt"] = prompt.message_id
     return LEAVEVC_CONFIRM
 
 
@@ -738,7 +793,7 @@ async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
-    log.error("Unhandled: %s", type(context.error).__name__, exc_info=context.error)
+    log.error("Unhandled bot error: %s", type(context.error).__name__)
     try:
         if isinstance(update, Update) and update.effective_message:
             await update.effective_message.reply_text(
@@ -769,58 +824,64 @@ async def _probe_backend() -> bool:
 # MAIN
 # ============================================================
 
-def main() -> None:
-    log.info("Starting bot — backend=%s (unlimited accounts, VC=all)", BACKEND_URL)
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+async def _require_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if (not update.effective_user or str(update.effective_user.id) != BOT_OWNER_ID
+            or not update.effective_chat or update.effective_chat.type != "private"):
+        if update.callback_query:
+            await update.callback_query.answer("Not authorized", show_alert=True)
+        raise ApplicationHandlerStop
 
-    login_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🔐 Login$"), login_entry)],
+
+async def _restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    await _cancel_pending_login(context)
+    context.user_data.clear()
+    await cmd_start(update, context)
+    return ConversationHandler.END
+
+
+async def _expired_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
+    await update.callback_query.answer("This button expired", show_alert=True)
+
+
+async def _post_init(application: Application) -> None:
+    await _probe_backend()
+
+
+def main() -> None:
+    if not TELEGRAM_BOT_TOKEN or not BACKEND_API_TOKEN or not BOT_OWNER_ID.isdecimal():
+        raise SystemExit("Set TELEGRAM_BOT_TOKEN, BACKEND_API_TOKEN and BOT_OWNER_ID")
+    if not BACKEND_URL.startswith(("http://", "https://")):
+        raise SystemExit("BACKEND_URL must start with http:// or https://")
+    log.info("Starting bot — backend=%s (unlimited accounts, VC=all)", BACKEND_URL)
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
+
+    app.add_handler(TypeHandler(Update, _require_owner), group=-1)
+    app.add_handler(ConversationHandler(
+        entry_points=[
+            MessageHandler(filters.Regex("^🔐 Login$"), login_entry),
+            MessageHandler(filters.Regex("^🎙️ Join VC$"), joinvc_entry),
+            MessageHandler(filters.Regex("^🔴 Leave VC$"), leavevc_entry),
+        ],
         states={
             LOGIN_LABEL: [MessageHandler(NOT_BUTTON_TEXT, login_label)],
             LOGIN_PHONE: [MessageHandler(NOT_BUTTON_TEXT, login_phone)],
-            LOGIN_OTP:   [MessageHandler(NOT_BUTTON_TEXT, login_otp)],
-            LOGIN_2FA:   [MessageHandler(NOT_BUTTON_TEXT, login_2fa)],
-        },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        allow_reentry=True,
-    )
-
-    joinvc_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🎙️ Join VC$"), joinvc_entry)],
-        states={
+            LOGIN_OTP: [MessageHandler(NOT_BUTTON_TEXT, login_otp)],
+            LOGIN_2FA: [MessageHandler(NOT_BUTTON_TEXT, login_2fa)],
             JOINVC_LINK: [MessageHandler(NOT_BUTTON_TEXT, joinvc_link)],
             JOINVC_CONFIRM: [
                 CallbackQueryHandler(joinvc_confirm, pattern=r"^join_(confirm|cancel)$"),
-                CallbackQueryHandler(joinvc_retry,   pattern=r"^join_retry$"),
+                CallbackQueryHandler(joinvc_retry, pattern=r"^join_retry$"),
             ],
-        },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        allow_reentry=True,
-        per_message=False,
-    )
-
-    leavevc_conv = ConversationHandler(
-        entry_points=[MessageHandler(filters.Regex("^🔴 Leave VC$"), leavevc_entry)],
-        states={
             LEAVEVC_LINK: [MessageHandler(NOT_BUTTON_TEXT, leavevc_link)],
             LEAVEVC_CONFIRM: [
                 CallbackQueryHandler(leavevc_confirm, pattern=r"^leave_(confirm|cancel)$"),
-                CallbackQueryHandler(leavevc_retry,   pattern=r"^leave_retry$"),
+                CallbackQueryHandler(leavevc_retry, pattern=r"^leave_retry$"),
             ],
         },
-        fallbacks=[CommandHandler("cancel", cmd_cancel)],
-        allow_reentry=True,
-        per_message=False,
-    )
-
-    # Commands that never conflict with conversations
+        fallbacks=[CommandHandler("cancel", cmd_cancel), CommandHandler("start", _restart)],
+    ))
     app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help",  cmd_help))
-
-    # Conversations first — their /cancel fallback must win while active
-    app.add_handler(login_conv)
-    app.add_handler(joinvc_conv)
-    app.add_handler(leavevc_conv)
+    app.add_handler(CommandHandler("help", cmd_help))
 
     # Top-level /cancel — only reached when nothing is active
     app.add_handler(CommandHandler("cancel", cmd_cancel))
@@ -835,13 +896,13 @@ def main() -> None:
 
     # Callbacks
     app.add_handler(CallbackQueryHandler(restore_callback, pattern=r"^restore_(yes|no)$"))
-    app.add_handler(CallbackQueryHandler(logout_callback,  pattern=r"^logout_(.+)$"))
+    app.add_handler(CallbackQueryHandler(logout_callback, pattern=r"^logout_(.+)$"))
+    app.add_handler(CallbackQueryHandler(_expired_callback))
 
     # Fallback
     app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
     app.add_error_handler(error_handler)
 
-    asyncio.run(_probe_backend())
     log.info("Bot polling started")
     app.run_polling(allowed_updates=["message", "callback_query"])
 
