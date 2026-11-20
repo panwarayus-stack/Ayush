@@ -2,7 +2,7 @@
 
 Install with `python -m pip install -r requirements.txt` in a virtual environment.
 
-Copy `credentials.example.json` to `credentials.json` beside `api.py` and `bot.py`, then fill in your existing values. No environment variables are required; any that are already set override the corresponding file values. Keep `credentials.json` private: Git ignores it. On Linux/macOS, use `chmod 600 credentials.json`.
+Keep your existing `credentials.json` beside `api.py` and `bot.py`. If you do not have one, create it as a JSON object using the setting names below as keys and your existing values as strings. No environment variables are required; any that are already set override the corresponding file values. Keep `credentials.json` private: Git ignores it. On Linux/macOS, use `chmod 600 credentials.json`.
 
 | Setting | Service | Value |
 | --- | --- | --- |

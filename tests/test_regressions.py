@@ -38,6 +38,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertIsNone(tg.play.await_args.kwargs['stream'])
 
     def test_chat_normalization(self):
+        self.assertEqual(bot._normalize_chat_ref("https://t.me/c/1234567890/42?single"), "-1001234567890")
         self.assertEqual(bot._normalize_chat_ref('https://t.me/example?voicechat'), '@example')
         self.assertEqual(bot._normalize_chat_ref('-10012345'), '-10012345')
         for text in ('https://t.me/+invite', 'https://example.com/group', '12345', '@'):
