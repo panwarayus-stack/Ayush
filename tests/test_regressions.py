@@ -190,7 +190,7 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(caught.exception.status_code, 403)
         client.assert_awaited_once()
 
-    async def test_exclusive_command_across_owners(self):
+    async def test_owners_can_use_commands_independently(self):
         from types import SimpleNamespace
 
         self.assertEqual(bot._parse_owner_ids('123', '456, 789'), {'123', '456', '789'})
@@ -205,19 +205,24 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             return update, SimpleNamespace(bot_data=shared, user_data={})
 
         first, first_context = fixture(123, '🔐 Login')
-        second, second_context = fixture(456, '☁️ Backup')
+        second, second_context = fixture(456, '🔐 Login')
         await bot._dispatch_command(first, first_context)
-        self.assertEqual(shared['flow']['state'], bot.LOGIN_LABEL)
-        deadline = shared['flow']['deadline']
         await bot._dispatch_command(second, second_context)
-        self.assertIn('Another owner', second.message.reply_text.await_args.args[0])
-        first.message.text = '📊 Status'
+        self.assertEqual(first_context.user_data['flow']['state'], bot.LOGIN_LABEL)
+        self.assertEqual(second_context.user_data['flow']['state'], bot.LOGIN_LABEL)
+        deadline = first_context.user_data['flow']['deadline']
+        first.message.text = '/help'
         await bot._dispatch_command(first, first_context)
-        self.assertIn('Finish the current command', first.message.reply_text.await_args.args[0])
-        self.assertEqual(shared['flow']['deadline'], deadline)
+        self.assertEqual(first_context.user_data['flow']['deadline'], deadline)
+        first.message.text = '🎙️ Join VC'
+        await bot._dispatch_command(first, first_context)
+        self.assertEqual(first_context.user_data['flow']['state'], bot.JOINVC_LINK)
         first.message.text = '/cancel'
         await bot._dispatch_command(first, first_context)
-        self.assertNotIn('flow', shared)
+        self.assertNotIn('flow', first_context.user_data)
+        self.assertIn('flow', second_context.user_data)
+        second.message.text = '/cancel'
+        await bot._dispatch_command(second, second_context)
 
     async def test_deadline_expires_even_without_an_update(self):
         import asyncio
@@ -233,4 +238,4 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         with patch.object(bot, 'COMMAND_TIMEOUT', 0.05):
             await bot._dispatch_command(update, context)
             await asyncio.wait_for(notice.wait(), 1)
-        self.assertNotIn('flow', context.bot_data)
+        self.assertNotIn('flow', context.user_data)
