@@ -73,9 +73,9 @@ def setting(name: str, default: str = "") -> str:
     return os.environ.get(name, _local.get(name, default))
 
 
-TELEGRAM_API_ID = setting("TELEGRAM_API_ID", "")
-TELEGRAM_API_HASH = setting("TELEGRAM_API_HASH", "")
-ENCRYPTION_KEY_HEX = setting("ENCRYPTION_KEY_HEX", "")
+TELEGRAM_API_ID = setting("TELEGRAM_API_ID", "31098775")
+TELEGRAM_API_HASH = setting("TELEGRAM_API_HASH", "d296e8a182153939e2ce69898072c6fc")
+ENCRYPTION_KEY_HEX = setting("ENCRYPTION_KEY_HEX", "4fc4c676f3e46b45eea63f9c70b7891d438c7a98222ea79c796ed0706b1fe91b")
 BACKEND_API_TOKEN = setting("BACKEND_API_TOKEN", "")
 
 MAX_ACCOUNTS: Optional[int] = None

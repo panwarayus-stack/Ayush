@@ -59,7 +59,7 @@ def setting(name: str, default: str = "") -> str:
 
 _DEFAULT_BACKEND_URL = "http://127.0.0.1:11584"
 
-TELEGRAM_BOT_TOKEN = setting("TELEGRAM_BOT_TOKEN", "").strip()
+TELEGRAM_BOT_TOKEN = setting("TELEGRAM_BOT_TOKEN", "9268658834:AAFIyVOtk8HRKqm_v-MHrNxIaDeyjBZau48").strip()
 BACKEND_URL        = setting("BACKEND_URL", _DEFAULT_BACKEND_URL).strip().rstrip("/")
 
 BACKEND_API_TOKEN = setting("BACKEND_API_TOKEN", "")
