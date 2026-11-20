@@ -5,9 +5,10 @@ No owner restriction — anyone with the bot username can use it.
 
 from __future__ import annotations
 
+from settings import setting
+
 import asyncio
 import logging
-import os
 import re
 import uuid
 
@@ -38,11 +39,11 @@ from telegram.ext import (
 
 _DEFAULT_BACKEND_URL = "http://127.0.0.1:11584"
 
-TELEGRAM_BOT_TOKEN = os.environ.get("TELEGRAM_BOT_TOKEN", "").strip()
-BACKEND_URL        = os.environ.get("BACKEND_URL", _DEFAULT_BACKEND_URL).strip().rstrip("/")
+TELEGRAM_BOT_TOKEN = setting("TELEGRAM_BOT_TOKEN", "").strip()
+BACKEND_URL        = setting("BACKEND_URL", _DEFAULT_BACKEND_URL).strip().rstrip("/")
 
-BACKEND_API_TOKEN = os.environ.get("BACKEND_API_TOKEN", "")
-BOT_OWNER_ID = os.environ.get("BOT_OWNER_ID", "")
+BACKEND_API_TOKEN = setting("BACKEND_API_TOKEN", "")
+BOT_OWNER_ID = setting("BOT_OWNER_ID", "")
 
 TIMEOUT        = 55.0
 BACKUP_TIMEOUT = 90.0
