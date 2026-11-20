@@ -1,14 +1,15 @@
 """
-bot.py — Telegram bot frontend for api.py backend (loopback, no auth).
-No owner restriction — anyone with the bot username can use it.
+bot.py — Telegram bot frontend for api.py backend.
+Only the configured owner can use the bot in private chat.
 """
 
 from __future__ import annotations
 
-from settings import setting
-
 import asyncio
+import json
 import logging
+import os
+import pathlib
 import re
 import uuid
 
@@ -36,6 +37,25 @@ from telegram.ext import (
 # ============================================================
 # CONFIG  (unchanged)
 # ============================================================
+
+def _load_settings(path: pathlib.Path) -> dict[str, str]:
+    try:
+        values = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        raise SystemExit(f"Cannot read {path.name}; expected a valid JSON file") from None
+    if not isinstance(values, dict) or any(not isinstance(value, str) for value in values.values()):
+        raise SystemExit(f"{path.name} must be a JSON object with string values")
+    return values
+
+
+_local = _load_settings(pathlib.Path(__file__).with_name("credentials.json"))
+
+
+def setting(name: str, default: str = "") -> str:
+    return os.environ.get(name, _local.get(name, default))
+
 
 _DEFAULT_BACKEND_URL = "http://127.0.0.1:11584"
 
@@ -138,6 +158,7 @@ LEAVEVC_LINK,  LEAVEVC_CONFIRM = range(6, 8)                # 6,7
 
 def _normalize_chat_ref(raw: str) -> str | None:
     s = raw.strip()
+    telegram_link = False
     for prefix in (
         "https://t.me/", "http://t.me/",
         "https://telegram.me/", "http://telegram.me/",
@@ -145,12 +166,16 @@ def _normalize_chat_ref(raw: str) -> str | None:
     ):
         if s.startswith(prefix):
             s = s[len(prefix):]
+            telegram_link = True
             break
     if "?" in s:
         s = s.split("?", 1)[0]
     s = s.rstrip("/")
     if not s:
         return None
+    private_post = re.fullmatch(r"c/([1-9][0-9]{0,17})/[1-9][0-9]*(?:/[1-9][0-9]*)?", s)
+    if telegram_link and private_post:
+        return "-100" + private_post.group(1)
     if s.startswith("+") or s.startswith("joinchat/"):
         return None
     if re.fullmatch(r"-[0-9]+", s):
@@ -668,7 +693,7 @@ async def joinvc_entry(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     await update.message.reply_text(
         "🎙️ Send the group / VC link.\n\n"
         "Accepted: `https://t.me/groupname`, `@groupname`, `-1001234567890`\n\n"
-        "Private invite links (t.me/+abc) are not supported.\n\n"
+        "For a private channel you already belong to, send a t.me/c/... post link or its -100… ID. Invite links are not supported.\n\n"
         "The bot will attempt to join with all registered accounts."
     )
     return JOINVC_LINK
@@ -679,7 +704,7 @@ async def joinvc_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     ref = _normalize_chat_ref(raw)
     if ref is None:
         await update.message.reply_text(
-            "❌ Private invite links are not supported.\n\n"
+            "❌ Use a public username, private t.me/c/... post link, or numeric chat ID. Invite links are not supported.\n\n"
             "Use a public @username or numeric chat ID.\n"
             "Examples: @mygroup  or  -1001234567890",
         )
@@ -740,7 +765,7 @@ async def leavevc_link(update: Update, context: ContextTypes.DEFAULT_TYPE) -> in
     ref = _normalize_chat_ref(raw)
     if ref is None:
         await update.message.reply_text(
-            "❌ Private invite links are not supported.\n\n"
+            "❌ Use a public username, private t.me/c/... post link, or numeric chat ID. Invite links are not supported.\n\n"
             "Use a public @username or numeric chat ID.",
         )
         return LEAVEVC_LINK

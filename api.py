@@ -8,8 +8,6 @@ correct WebRTC negotiation, keep-alive, and reconnection.
 
 from __future__ import annotations
 
-from settings import setting
-
 import asyncio
 import base64
 import hashlib
@@ -30,7 +28,7 @@ from fastapi import FastAPI, HTTPException, Request
 from fastapi.exceptions import RequestValidationError
 from fastapi.responses import JSONResponse
 from pydantic import BaseModel, Field, field_validator
-from telethon import TelegramClient
+from telethon import TelegramClient, types, utils
 from telethon.errors import (
     AuthKeyUnregisteredError,
     ChannelPrivateError,
@@ -55,6 +53,25 @@ from pytgcalls.exceptions import (
 # ============================================================
 # CONFIG
 # ============================================================
+
+def _load_settings(path: pathlib.Path) -> dict[str, str]:
+    try:
+        values = json.loads(path.read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return {}
+    except (OSError, ValueError):
+        raise SystemExit(f"Cannot read {path.name}; expected a valid JSON file") from None
+    if not isinstance(values, dict) or any(not isinstance(value, str) for value in values.values()):
+        raise SystemExit(f"{path.name} must be a JSON object with string values")
+    return values
+
+
+_local = _load_settings(pathlib.Path(__file__).with_name("credentials.json"))
+
+
+def setting(name: str, default: str = "") -> str:
+    return os.environ.get(name, _local.get(name, default))
+
 
 TELEGRAM_API_ID = setting("TELEGRAM_API_ID", "")
 TELEGRAM_API_HASH = setting("TELEGRAM_API_HASH", "")
@@ -739,7 +756,27 @@ class VoiceEngine(PyTgCalls):
     def __init__(self, client: TelegramClient, account_id: str):
         super().__init__(client)
         self.account_id = account_id
+        self.telegram_client = client
         self.connected_chats: set[int] = set()
+
+    async def resolve_chat_id(self, chat_id):
+        resolved = await super().resolve_chat_id(chat_id)
+        _, peer_type = utils.resolve_id(resolved)
+        if peer_type is types.PeerChannel:
+            # StringSession does not persist channel access hashes across restarts.
+            # Populate Telethon's cache from dialogs if the numeric peer is unknown.
+            try:
+                await self.telegram_client.get_input_entity(resolved)
+            except ValueError:
+                async def find_dialog():
+                    async for dialog in self.telegram_client.iter_dialogs():
+                        if dialog.id == resolved:
+                            return True
+                    return False
+
+                if not await asyncio.wait_for(find_dialog(), TELEGRAM_TIMEOUT):
+                    raise HTTPException(403, "This Telegram account cannot access the private channel. Check its membership and the chat ID.")
+        return resolved
 
     async def _handle_connection_changed(self, chat_id, net_state):
         if net_state.kind != ConnectionKind.NORMAL:
@@ -899,14 +936,14 @@ async def _join_voice_call(account_id: str, chat: str) -> dict[str, Any]:
         tg = await _get_tgcalls(account_id)
         chat_id = await tg.resolve_chat_id(chat)
         if chat_id >= 0:
-            return {"ok": False, "error": "A group chat is required", "status_code": 400}
+            return {"ok": False, "error": "A group or channel is required", "status_code": 400}
         await _connect_voice_call(tg, chat_id)
         app_state["voice_targets"].setdefault(account_id, {})[chat_id] = (0, 0.0)
         return {"ok": True}
     except HTTPException as exc:
         return {"ok": False, "error": exc.detail, "status_code": exc.status_code}
     except (ChannelPrivateError, GroupcallForbiddenError):
-        return {"ok": False, "error": "Access to the voice chat was denied", "status_code": 403}
+        return {"ok": False, "error": "Telegram denied access. Check that this account belongs to the channel and can join its voice chat.", "status_code": 403}
     except TimeoutError:
         return {"ok": False, "error": "Voice transport timed out", "status_code": 504}
     except NoActiveGroupCall:
@@ -949,6 +986,8 @@ async def _leave_voice_call(account_id: str, chat: str) -> dict[str, Any]:
             if not was_requested:
                 raise
         return {"ok": True}
+    except HTTPException as exc:
+        return {"ok": False, "error": exc.detail, "status_code": exc.status_code}
     except NotInCallError:
         return {"ok": False, "error": "Not currently in the specified call"}
     except NoActiveGroupCall:
