@@ -41,7 +41,9 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
         self.assertEqual(bot._normalize_chat_ref("https://t.me/c/1234567890/42?single"), "-1001234567890")
         self.assertEqual(bot._normalize_chat_ref('https://t.me/example?voicechat'), '@example')
         self.assertEqual(bot._normalize_chat_ref('-10012345'), '-10012345')
-        for text in ('https://t.me/+invite', 'https://example.com/group', '12345', '@'):
+        self.assertEqual(bot._normalize_chat_ref('https://t.me/+invite'), '+invite')
+        self.assertEqual(bot._normalize_chat_ref('https://t.me/joinchat/invite'), '+invite')
+        for text in ('https://example.com/group', '12345', '@'):
             self.assertIsNone(bot._normalize_chat_ref(text))
 
     async def test_repeated_drops_rejoin_until_explicit_leave(self):
@@ -168,3 +170,22 @@ class RegressionTests(unittest.IsolatedAsyncioTestCase):
             result = await bot._voice_confirm(SimpleNamespace(callback_query=query), context, 'join')
         self.assertEqual(result, bot.JOINVC_CONFIRM)
         get.assert_not_awaited()
+
+    async def test_private_invite_joins_channel_before_voice_and_leave_does_not_import(self):
+        from types import SimpleNamespace
+
+        check_result = object()
+        joined = api.types.Chat(id=42, title='Private group', photo=api.types.ChatPhotoEmpty(),
+                                participants_count=1, date=None, version=1)
+        client = AsyncMock(side_effect=[check_result, SimpleNamespace(chats=[joined])])
+        tg = SimpleNamespace(telegram_client=client)
+        self.assertEqual(await api._resolve_voice_target(tg, '+invite', join_channel=True), -42)
+        requests = [call.args[0] for call in client.await_args_list]
+        self.assertIsInstance(requests[0], api.functions.messages.CheckChatInviteRequest)
+        self.assertIsInstance(requests[1], api.functions.messages.ImportChatInviteRequest)
+        client.reset_mock(side_effect=True)
+        client.return_value = check_result
+        with self.assertRaises(api.HTTPException) as caught:
+            await api._resolve_voice_target(tg, '+invite', join_channel=False)
+        self.assertEqual(caught.exception.status_code, 403)
+        client.assert_awaited_once()
