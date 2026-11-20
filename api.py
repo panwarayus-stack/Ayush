@@ -87,7 +87,7 @@ BACKEND_API_TOKEN = setting("BACKEND_API_TOKEN", "")
 MAX_ACCOUNTS: Optional[int] = None
 
 DB_PATH = pathlib.Path(setting("DB_PATH", str(pathlib.Path(__file__).resolve().parent / "db.json"))).resolve()
-LOGIN_TTL = 600
+LOGIN_TTL = 15 * 60
 TELEGRAM_TIMEOUT = 20
 
 BIND_HOST = "127.0.0.1"
@@ -662,7 +662,22 @@ async def send_login_code(account_id: str, payload: SendCodeRequest) -> dict[str
         "client": client, "phone": payload.phone,
         "phone_code_hash": sent.phone_code_hash, "created_at": time.monotonic(),
     }
-    return {"sent": True, "account_id": account_id}
+    delivery = type(getattr(sent, "type", None)).__name__
+    method = {
+        "SentCodeTypeApp": "telegram_app",
+        "SentCodeTypeSms": "sms",
+        "SentCodeTypeSmsWord": "sms",
+        "SentCodeTypeSmsPhrase": "sms",
+        "SentCodeTypeCall": "call",
+        "SentCodeTypeFlashCall": "call",
+        "SentCodeTypeMissedCall": "call",
+        "SentCodeTypeEmailCode": "email",
+        "SentCodeTypeSetUpEmailRequired": "email_setup",
+        "SentCodeTypeFragmentSms": "fragment",
+        "SentCodeTypeFirebaseSms": "official_app_required",
+    }.get(delivery, "unknown")
+    log.info("Telegram login challenge account=%s delivery=%s", account_id, method)
+    return {"sent": True, "account_id": account_id, "delivery": method}
 
 
 @app.post("/accounts/{account_id}/login/verify")

@@ -21,17 +21,13 @@ from telegram import (
     ReplyKeyboardMarkup,
     Update,
 )
-from telegram.error import TelegramError
+from telegram.error import Conflict, TelegramError
 from telegram.ext import (
     Application,
     ApplicationHandlerStop,
     TypeHandler,
-    CallbackQueryHandler,
-    CommandHandler,
     ContextTypes,
     ConversationHandler,
-    MessageHandler,
-    filters,
 )
 
 # ============================================================
@@ -64,6 +60,15 @@ BACKEND_URL        = setting("BACKEND_URL", _DEFAULT_BACKEND_URL).strip().rstrip
 
 BACKEND_API_TOKEN = setting("BACKEND_API_TOKEN", "")
 BOT_OWNER_ID = setting("BOT_OWNER_ID", "")
+BOT_OWNER_IDS = setting("BOT_OWNER_IDS", "")
+COMMAND_TIMEOUT = 15 * 60
+
+
+def _parse_owner_ids(*values: str) -> set[str]:
+    ids = set(re.split(r"[\s,]+", " ".join(values).strip())) - {""}
+    if not ids or any(not re.fullmatch(r"[1-9][0-9]*", owner) for owner in ids):
+        raise ValueError("Use positive numeric Telegram IDs in BOT_OWNER_IDS or BOT_OWNER_ID")
+    return ids
 
 TIMEOUT        = 55.0
 BACKUP_TIMEOUT = 90.0
@@ -139,13 +144,6 @@ MAIN_KEYBOARD = ReplyKeyboardMarkup(
     ],
     resize_keyboard=True,
 )
-
-BUTTON_TEXTS = [
-    "📊 Status", "👥 Accounts", "🔐 Login", "🚪 Logout",
-    "☁️ Backup", "♻️ Restore", "🎙️ Join VC", "🔴 Leave VC", "❔ Help",
-]
-BUTTON_PATTERN = "^(" + "|".join(re.escape(t) for t in BUTTON_TEXTS) + ")$"
-NOT_BUTTON_TEXT = filters.TEXT & ~filters.COMMAND & ~filters.Regex(BUTTON_PATTERN)
 
 # Conversation states
 LOGIN_LABEL, LOGIN_PHONE, LOGIN_OTP, LOGIN_2FA = range(4)   # 0..3
@@ -462,7 +460,25 @@ async def login_phone(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         await update.message.reply_text(f"❌ OTP send failed: {r.status_code} {_detail(r)}", reply_markup=MAIN_KEYBOARD)
         context.user_data.clear(); return ConversationHandler.END
 
-    await update.message.reply_text("✅ OTP sent by Telegram. Enter the code now:")
+    delivery = r.json().get("delivery")
+    instructions = {
+        "telegram_app": "Check the official Telegram service chat on a device already signed in to this account. Telegram did not choose SMS.",
+        "sms": "Check text messages on the phone number you entered.",
+        "call": "Telegram chose phone-call verification. Check incoming or missed calls and follow Telegram’s instructions.",
+        "email": "Check the login email associated with this Telegram account.",
+    }.get(delivery)
+    if delivery in {"email_setup", "fragment", "official_app_required"}:
+        await _cancel_pending_login(context)
+        context.user_data.clear()
+        await update.message.reply_text(
+            "Telegram requires a verification method this bot does not support. Use the official Telegram app to complete account verification.",
+            reply_markup=MAIN_KEYBOARD,
+        )
+        return ConversationHandler.END
+    await update.message.reply_text(
+        (instructions or "Telegram accepted the request but did not report a recognized delivery method. Check your signed-in Telegram app, SMS, and login email.")
+        + "\n\nEnter the code when it arrives, or use /cancel."
+    )
     return LOGIN_OTP
 
 
@@ -826,11 +842,14 @@ async def fallback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
+    if isinstance(context.error, Conflict):
+        log.error("Telegram polling conflict: stop other instances using this bot token and disable any active webhook before polling")
+        return
     log.error("Unhandled bot error: %s", type(context.error).__name__)
     try:
         if isinstance(update, Update) and update.effective_message:
             await update.effective_message.reply_text(
-                f"⚠️ Error: {type(context.error).__name__}\nSend /start to reset."
+                f"⚠️ Error: {type(context.error).__name__}\nUse the menu to try again."
             )
     except Exception:
         pass
@@ -861,18 +880,11 @@ async def _probe_backend() -> bool:
 # ============================================================
 
 async def _require_owner(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    if (not update.effective_user or str(update.effective_user.id) != BOT_OWNER_ID
+    if (not update.effective_user or str(update.effective_user.id) not in context.bot_data.get("owners", set())
             or not update.effective_chat or update.effective_chat.type != "private"):
         if update.callback_query:
             await update.callback_query.answer("Not authorized", show_alert=True)
         raise ApplicationHandlerStop
-
-
-async def _restart(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    await _cancel_pending_login(context)
-    context.user_data.clear()
-    await cmd_start(update, context)
-    return ConversationHandler.END
 
 
 async def _expired_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -883,14 +895,144 @@ async def _post_init(application: Application) -> None:
     await _probe_backend()
 
 
+WAIT_RESTORE, WAIT_LOGOUT = range(8, 10)
+STEP_HANDLERS = {
+    LOGIN_LABEL: login_label, LOGIN_PHONE: login_phone,
+    LOGIN_OTP: login_otp, LOGIN_2FA: login_2fa,
+    JOINVC_LINK: joinvc_link, LEAVEVC_LINK: leavevc_link,
+}
+MENU_HANDLERS = {
+    "🔐 Login": login_entry, "🚪 Logout": cmd_logout,
+    "🎙️ Join VC": joinvc_entry, "🔴 Leave VC": leavevc_entry,
+    "♻️ Restore": cmd_restore, "☁️ Backup": cmd_backup,
+    "📊 Status": cmd_status, "👥 Accounts": cmd_accounts,
+    "❔ Help": cmd_help, "/help": cmd_help, "/start": cmd_start,
+}
+
+
+def _clear_flow(context, flow) -> None:
+    timer = flow.pop("timer", None)
+    if timer:
+        timer.cancel()
+    if context.bot_data.get("flow") is flow:
+        context.bot_data.pop("flow", None)
+        context.user_data.clear()
+
+
+async def _expire_flow(update, context, flow) -> None:
+    if context.bot_data.get("flow") is not flow or flow.get("expiring"):
+        return
+    flow["expiring"] = True
+    try:
+        await _cancel_pending_login(context)
+    finally:
+        _clear_flow(context, flow)
+    await context.bot.send_message(flow["chat_id"], "⌛ Command timed out after 15 minutes. Start it again.",
+                                   reply_markup=MAIN_KEYBOARD)
+
+
+def _flow_callback(state, data):
+    if state == WAIT_RESTORE and data in {"restore_yes", "restore_no"}:
+        return restore_callback
+    if state == WAIT_LOGOUT and data.startswith("logout_"):
+        return logout_callback
+    if state == JOINVC_CONFIRM:
+        return {"join_confirm": joinvc_confirm, "join_cancel": joinvc_confirm, "join_retry": joinvc_retry}.get(data)
+    if state == LEAVEVC_CONFIRM:
+        return {"leave_confirm": leavevc_confirm, "leave_cancel": leavevc_confirm, "leave_retry": leavevc_retry}.get(data)
+    return None
+
+
+async def _dispatch_command(update, context) -> None:
+    loop = asyncio.get_running_loop()
+    flow = context.bot_data.get("flow")
+    query = update.callback_query
+    message = update.message
+    text = message.text if message and message.text else ""
+    command = text.split(maxsplit=1)[0].split("@", 1)[0].lower() if text.startswith("/") else text
+    owner = update.effective_user.id
+
+    if flow is not None:
+        if flow["owner"] != owner:
+            if query:
+                await query.answer("Another owner has a command in progress", show_alert=True)
+            elif text:
+                await message.reply_text("⏳ Another owner has a command in progress. Try again when it finishes.")
+            return
+        if loop.time() >= flow["deadline"]:
+            if query:
+                await query.answer("Command expired", show_alert=True)
+            await _expire_flow(update, context, flow)
+            return
+        state = flow.get("state")
+        if query:
+            handler = _flow_callback(state, query.data or "")
+            if handler is None:
+                await _expired_callback(update, context)
+                return
+        elif command == "/cancel":
+            handler = cmd_cancel
+        elif text and not text.startswith("/") and text not in MENU_HANDLERS and state in STEP_HANDLERS:
+            handler = STEP_HANDLERS[state]
+        else:
+            if message:
+                await message.reply_text("⏳ Finish the current command or use /cancel before starting another.")
+            return
+    else:
+        if query:
+            await _expired_callback(update, context)
+            return
+        handler = MENU_HANDLERS.get(command)
+        if handler is None:
+            if command == "/cancel":
+                await message.reply_text("No command is running.")
+            elif text:
+                await fallback(update, context)
+            return
+        flow = {"owner": owner, "chat_id": update.effective_chat.id,
+                "deadline": loop.time() + COMMAND_TIMEOUT}
+        context.bot_data["flow"] = flow
+
+    timer = flow.pop("timer", None)
+    if timer:
+        timer.cancel()
+    try:
+        state = await asyncio.wait_for(handler(update, context), max(0, flow["deadline"] - loop.time()))
+    except TimeoutError:
+        await _expire_flow(update, context, flow)
+        return
+    except (Exception, asyncio.CancelledError):
+        try:
+            await _cancel_pending_login(context)
+        finally:
+            _clear_flow(context, flow)
+        raise
+
+    if handler is cmd_restore and context.user_data.get("restore_prompt"):
+        state = WAIT_RESTORE
+    elif handler is cmd_logout and context.user_data.get("logout_choices"):
+        state = WAIT_LOGOUT
+    elif handler is restore_callback and context.user_data.get("restore_prompt"):
+        state = WAIT_RESTORE
+
+    if state is None or state == ConversationHandler.END:
+        _clear_flow(context, flow)
+        return
+    flow["state"] = state
+    flow["timer"] = loop.call_at(flow["deadline"], lambda: context.application.create_task(
+        _expire_flow(update, context, flow), update=update))
+
+
 def main() -> None:
     invalid = []
     if ":" not in TELEGRAM_BOT_TOKEN:
         invalid.append("TELEGRAM_BOT_TOKEN")
     if not BACKEND_API_TOKEN.strip():
         invalid.append("BACKEND_API_TOKEN")
-    if not BOT_OWNER_ID.isascii() or not BOT_OWNER_ID.isdecimal() or int(BOT_OWNER_ID) <= 0:
-        invalid.append("BOT_OWNER_ID")
+    try:
+        owners = _parse_owner_ids(BOT_OWNER_ID, BOT_OWNER_IDS)
+    except ValueError:
+        invalid.append("BOT_OWNER_IDS (or BOT_OWNER_ID)")
     if invalid:
         raise SystemExit("Missing or invalid bot settings: " + ", ".join(invalid)
                          + ". Configure credentials.json beside bot.py or set environment variables.")
@@ -899,52 +1041,9 @@ def main() -> None:
     log.info("Starting bot — backend=%s (unlimited accounts, VC=all)", BACKEND_URL)
     app = Application.builder().token(TELEGRAM_BOT_TOKEN).post_init(_post_init).build()
 
+    app.bot_data["owners"] = owners
     app.add_handler(TypeHandler(Update, _require_owner), group=-1)
-    app.add_handler(ConversationHandler(
-        entry_points=[
-            MessageHandler(filters.Regex("^🔐 Login$"), login_entry),
-            MessageHandler(filters.Regex("^🎙️ Join VC$"), joinvc_entry),
-            MessageHandler(filters.Regex("^🔴 Leave VC$"), leavevc_entry),
-        ],
-        states={
-            LOGIN_LABEL: [MessageHandler(NOT_BUTTON_TEXT, login_label)],
-            LOGIN_PHONE: [MessageHandler(NOT_BUTTON_TEXT, login_phone)],
-            LOGIN_OTP: [MessageHandler(NOT_BUTTON_TEXT, login_otp)],
-            LOGIN_2FA: [MessageHandler(NOT_BUTTON_TEXT, login_2fa)],
-            JOINVC_LINK: [MessageHandler(NOT_BUTTON_TEXT, joinvc_link)],
-            JOINVC_CONFIRM: [
-                CallbackQueryHandler(joinvc_confirm, pattern=r"^join_(confirm|cancel)$"),
-                CallbackQueryHandler(joinvc_retry, pattern=r"^join_retry$"),
-            ],
-            LEAVEVC_LINK: [MessageHandler(NOT_BUTTON_TEXT, leavevc_link)],
-            LEAVEVC_CONFIRM: [
-                CallbackQueryHandler(leavevc_confirm, pattern=r"^leave_(confirm|cancel)$"),
-                CallbackQueryHandler(leavevc_retry, pattern=r"^leave_retry$"),
-            ],
-        },
-        fallbacks=[CommandHandler("cancel", cmd_cancel), CommandHandler("start", _restart)],
-    ))
-    app.add_handler(CommandHandler("start", cmd_start))
-    app.add_handler(CommandHandler("help", cmd_help))
-
-    # Top-level /cancel — only reached when nothing is active
-    app.add_handler(CommandHandler("cancel", cmd_cancel))
-
-    # Button handlers
-    app.add_handler(MessageHandler(filters.Regex("^📊 Status$"),   cmd_status))
-    app.add_handler(MessageHandler(filters.Regex("^👥 Accounts$"), cmd_accounts))
-    app.add_handler(MessageHandler(filters.Regex("^🚪 Logout$"),   cmd_logout))
-    app.add_handler(MessageHandler(filters.Regex("^☁️ Backup$"),   cmd_backup))
-    app.add_handler(MessageHandler(filters.Regex("^♻️ Restore$"),  cmd_restore))
-    app.add_handler(MessageHandler(filters.Regex("^❔ Help$"),      cmd_help))
-
-    # Callbacks
-    app.add_handler(CallbackQueryHandler(restore_callback, pattern=r"^restore_(yes|no)$"))
-    app.add_handler(CallbackQueryHandler(logout_callback, pattern=r"^logout_(.+)$"))
-    app.add_handler(CallbackQueryHandler(_expired_callback))
-
-    # Fallback
-    app.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, fallback))
+    app.add_handler(TypeHandler(Update, _dispatch_command))
     app.add_error_handler(error_handler)
 
     log.info("Bot polling started")
